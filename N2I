@@ -8,21 +8,28 @@ from dataclasses import dataclass, field
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import numpy as np
-from noise2inverse.datasets import (
-    TiffDataset,
-    Noise2InverseDataset,
-)
 
 
 
 
-# Skipping tiffs for intial hyperparameter tuning (for example skip first 100 and last 100 slices)
+# Skipping tiffs for initial hyperparameter tuning (for example skip first 100 and last 100 slices)
 @dataclass
+class SkipDataset(torch.utils.data.Dataset):
+    """Wraps any Dataset and skips a fixed number of items from each end."""
+    base_ds:    object
+    skip_start: int = 100
+    skip_end:   int = 100
 
+    def __post_init__(self):
+        total = len(self.base_ds)
+        end = max(self.skip_start, total - self.skip_end)
+        self._indices = list(range(self.skip_start, end))
 
+    def __len__(self):
+        return len(self._indices)
 
-
-
+    def __getitem__(self, idx):
+        return self.base_ds[self._indices[idx]]
 
 
 # PairedRandomCrop applies the same random crop to both input and target tensors.
@@ -46,8 +53,7 @@ class PairedRandomCrop:
         return TF.crop(inp, i, j, h, w), TF.crop(tgt, i, j, h, w)
 
 
-
-# PatchDataset 
+# PatchDataset
 @dataclass
 class PatchDataset(torch.utils.data.Dataset):
     base_ds: object
@@ -64,22 +70,77 @@ class PatchDataset(torch.utils.data.Dataset):
         return self.crop(inp, tgt)
 
 
+def select_rois(image: np.ndarray, roi_size: int = 64):
+    """Select flat (noise) and edge ROI positions using gradient magnitude.
+
+    Divides the image into non-overlapping patches of *roi_size* and picks:
+    - the patch with the lowest mean gradient magnitude (flat / noise ROI)
+    - the patch with the highest mean gradient magnitude (edge ROI)
+
+    Parameters
+    ----------
+    image    : 2-D or 3-D (C, H, W) NumPy array
+    roi_size : side length of each square patch in pixels
+
+    Returns
+    -------
+    flat_rc  : (row, col) top-left corner of the lowest-gradient patch
+    edge_rc  : (row, col) top-left corner of the highest-gradient patch
+    roi_size : echoed back for caller convenience
+    """
+    img = np.asarray(image)
+    if img.ndim > 2:
+        img = img[0]
+
+    img_f = img.astype(float)
+    grad_y = np.gradient(img_f, axis=0)
+    grad_x = np.gradient(img_f, axis=1)
+    grad_mag = np.sqrt(grad_x ** 2 + grad_y ** 2)
+
+    h, w = img.shape
+    best_flat_score =  np.inf
+    best_edge_score = -np.inf
+    flat_rc = (0, 0)
+    edge_rc = (0, 0)
+
+    for r in range(0, h - roi_size + 1, roi_size):
+        for c in range(0, w - roi_size + 1, roi_size):
+            score = grad_mag[r:r + roi_size, c:c + roi_size].mean()
+            if score < best_flat_score:
+                best_flat_score = score
+                flat_rc = (r, c)
+            if score > best_edge_score:
+                best_edge_score = score
+                edge_rc = (r, c)
+
+    return flat_rc, edge_rc, roi_size
+
+
 # Class to track training and validation losses, save curves and image grids, and summarize results.
 @dataclass
 class Plots:
     output_dir: Path
     run_label:  str
-    train_losses:    list = field(default_factory=list)
-    val_losses:      list = field(default_factory=list)
+    train_losses:     list = field(default_factory=list)
+    val_losses:       list = field(default_factory=list)
+    noise_stds:       list = field(default_factory=list)
+    noise_reductions: list = field(default_factory=list)
 
     def update(self, train_loss, val_loss, metrics: dict):
         self.train_losses.append(train_loss)
         self.val_losses.append(val_loss)
+        self.noise_stds.append(metrics.get("noise_std", float("nan")))
+        self.noise_reductions.append(metrics.get("noise_reduction", float("nan")))
 
     def save_curves(self):
         epochs = range(1, len(self.train_losses) + 1)
-        
-
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(epochs, self.train_losses, label="train")
+        ax.plot(epochs, self.val_losses,   label="val")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("MSE loss")
+        ax.set_title(self.run_label)
+        ax.legend()
         plt.tight_layout()
         fig.savefig(self.output_dir / f"{self.run_label}_curves.png", dpi=150)
         plt.close(fig)
@@ -142,91 +203,174 @@ class Plots:
 
 
 # Training/validation split class
+@dataclass
+class TrainValSplit:
+    """Splits a dataset into train and validation subsets by index."""
+    dataset:        object
+    train_fraction: float = 0.80
+
+    def __post_init__(self):
+        n = len(self.dataset)
+        n_train = int(n * self.train_fraction)
+        indices = list(range(n))
+        self.train_dataset = torch.utils.data.Subset(self.dataset, indices[:n_train])
+        self.val_dataset   = torch.utils.data.Subset(self.dataset, indices[n_train:])
 
 
+if __name__ == "__main__":
+    from noise2inverse.datasets import TiffDataset, Noise2InverseDataset
 
+    # Directories
+    train_dir = Path("/mnt/scratch/users/mms10/recon")
+    output_dir = Path("weights")
+    output_dir.mkdir(exist_ok=True)
 
+    # Parameters
+    num_splits = 4
+    strategy   = "X:1"
+    epochs         = torch.tensor([100, 200])[0]
+    batch_size     = torch.tensor([4, 8, 16, 32, 64])[2]
+    multi_gpu      = False
+    device         = torch.device("cuda")
+    network        = "msd"
+    patch_size     = torch.tensor([256, 512, 1024])[0]
+    learning_rate  = torch.tensor([1e-4, 1e-3, 1e-2])[1]
+    training_validation_split = 0.80  # 80% for training, 20% for validation
+    slab_size = torch.tensor([1, 3, 5])[0]  # number of adjacent slices (must be odd)
 
-
-
-
-# Directories
-train_dir = Path("/mnt/scratch/users/mms10/recon")
-output_dir = Path("weights")
-output_dir.mkdir(exist_ok=True)
-
-
-# Parameters
-num_splits = 4
-strategy = "X:1"
-epochs = torch.tensor([100, 200])[0]
-batch_size = torch.tensor([4, 8, 16, 32, 64])[2]
-multi_gpu = False
-device = torch.device("cuda")
-network = "msd"
-patch_size = torch.tensor([256, 512, 1024])[0]
-learning_rate = torch.tensor([1e-4, 1e-3, 1e-2])[1]
-training_validation_split = 0.80 # 80% for training, 20% for validation
-slab_size = torch.tensor([1, 3, 5])[0] # number of adjacent slices to use as input (must be odd number)
-
-
-
-# Scale pixel intensities during training such that its values roughly occupy the range [0,1].
-# This improves convergence.
-data_scaling = 200
-
-datasets = [TiffDataset(train_dir / f"{j}/*.tiff") for j in range(num_splits)]
-train_ds = PatchDataset(Noise2InverseDataset(*datasets, strategy=strategy), patch_size=patch_size)
-
-train_ds.base_ds.num_slices, train_ds.base_ds.num_splits
-
-
-
-# Dataloader and network:
-dl = DataLoader(
-    train_ds,
-    batch_size=batch_size,
-    shuffle=True,
-    num_workers=4, # 
-    pin_memory=True, # 
-    persistent_workers=True, #
-)
-
-# Option a) Use MSD network
-if network == "msd":
-    from msd_pytorch import MSDRegressionModel
-    model = MSDRegressionModel(1, 1, 100, 1, parallel=multi_gpu)
-    net = model.net
-    net = model.net.to(device)
-    optim = model.optimizer
-
-
-
-# The dataset contains multiple input-target pairs for each slice. 
-# Therefore, we divide by the number of splits to obtain the effective number of epochs.
-train_epochs = max(epochs // num_splits, 1)
-
-# training loop
-for epoch in range(train_epochs):
-    # Train
-    for (inp, tgt) in tqdm(dl):
-        inp = inp.to(device, non_blocking=True) * data_scaling
-        tgt = tgt.to(device, non_blocking=True) * data_scaling
-
-        # Do training step with masking
-        output = net(inp)
-        loss = nn.functional.mse_loss(output, tgt)
-        optim.zero_grad()
-        loss.backward()
-        optim.step()
-
-    # Save network 
-    torch.save(
-        {"epoch": int(epoch), "state_dict": net.state_dict(), "optimizer": optim.state_dict()}, 
-        output_dir / f"weights_epoch_{epoch}.torch"
+    run_label = (
+        f"{network}_lr{float(learning_rate):.0e}"
+        f"_bs{int(batch_size)}_ps{int(patch_size)}"
     )
-    
-torch.save(
-    {"epoch": int(epoch), "state_dict": net.state_dict(), "optimizer": optim.state_dict()}, 
-    output_dir / "weights.torch"
-)
+
+    # Scale pixel intensities during training such that values roughly occupy [0, 1].
+    # This improves convergence.
+    data_scaling = 200
+
+    base_datasets = [TiffDataset(train_dir / f"{j}/*.tiff") for j in range(num_splits)]
+    # Skip first/last 100 slices for initial hyperparameter tuning
+    base_datasets = [SkipDataset(ds, skip_start=100, skip_end=100) for ds in base_datasets]
+
+    n2i_ds = Noise2InverseDataset(*base_datasets, strategy=strategy)
+
+    # Split into train and validation subsets
+    split = TrainValSplit(n2i_ds, train_fraction=training_validation_split)
+    train_patch_ds = PatchDataset(split.train_dataset, patch_size=patch_size)
+    val_patch_ds   = PatchDataset(split.val_dataset,   patch_size=patch_size)
+
+    print(
+        f"Slices — train: {len(split.train_dataset)}  "
+        f"val: {len(split.val_dataset)}"
+    )
+
+    # Dataloaders
+    dl = DataLoader(
+        train_patch_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+    )
+    val_dl = DataLoader(
+        val_patch_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+    )
+
+    # Option a) Use MSD network
+    if network == "msd":
+        from msd_pytorch import MSDRegressionModel
+        model = MSDRegressionModel(1, 1, 100, 1, parallel=multi_gpu)
+        net   = model.net.to(device)
+        optim = model.optimizer
+
+    plots = Plots(output_dir=output_dir, run_label=run_label)
+
+    # The dataset contains multiple input-target pairs for each slice.
+    # Divide by num_splits to get the effective number of epochs.
+    train_epochs = max(epochs // num_splits, 1)
+
+    # Training loop
+    for epoch in range(train_epochs):
+
+        # ── Train ────────────────────────────────────────────────────────────
+        net.train()
+        train_loss_sum = 0.0
+        for inp, tgt in tqdm(dl, desc=f"Epoch {epoch + 1}/{train_epochs} [train]"):
+            inp = inp.to(device, non_blocking=True) * data_scaling
+            tgt = tgt.to(device, non_blocking=True) * data_scaling
+
+            output = net(inp)
+            loss   = nn.functional.mse_loss(output, tgt)
+            optim.zero_grad()
+            loss.backward()
+            optim.step()
+            train_loss_sum += loss.item()
+
+        train_loss = train_loss_sum / len(dl)
+
+        # ── Validate ──────────────────────────────────────────────────────────
+        net.eval()
+        val_loss_sum = 0.0
+        noise_stds_epoch       = []
+        noise_reductions_epoch = []
+        first_val_batch        = None
+
+        with torch.no_grad():
+            for inp_val, tgt_val in tqdm(val_dl, desc=f"Epoch {epoch + 1}/{train_epochs} [val]"):
+                inp_val = inp_val.to(device, non_blocking=True) * data_scaling
+                tgt_val = tgt_val.to(device, non_blocking=True) * data_scaling
+                pred_val = net(inp_val)
+                val_loss_sum += nn.functional.mse_loss(pred_val, tgt_val).item()
+
+                # Noise metrics from flat ROI on the first sample of each batch
+                pred_np = pred_val[0, 0].cpu().numpy()
+                inp_np  = inp_val[0, 0].cpu().numpy()
+                flat_rc, _, rs = select_rois(pred_np)
+                r, c = flat_rc
+                noise_std     = float(pred_np[r:r + rs, c:c + rs].std())
+                inp_noise_std = float(inp_np[r:r + rs, c:c + rs].std())
+                noise_stds_epoch.append(noise_std)
+                noise_reductions_epoch.append(inp_noise_std / (noise_std + 1e-8))
+
+                if first_val_batch is None:
+                    first_val_batch = (
+                        inp_np,
+                        pred_np,
+                        tgt_val[0, 0].cpu().numpy(),
+                    )
+
+        val_loss = val_loss_sum / len(val_dl)
+        metrics  = {
+            "noise_std":       float(np.mean(noise_stds_epoch)),
+            "noise_reduction": float(np.mean(noise_reductions_epoch)),
+        }
+
+        plots.update(train_loss, val_loss, metrics)
+        plots.save_curves()
+        if first_val_batch is not None:
+            plots.save_image_grid(*first_val_batch, epoch=epoch + 1)
+
+        # Save network checkpoint
+        torch.save(
+            {"epoch": int(epoch), "state_dict": net.state_dict(), "optimizer": optim.state_dict()},
+            output_dir / f"weights_epoch_{epoch}.torch",
+        )
+        print(
+            f"Epoch {epoch + 1}/{train_epochs}  "
+            f"train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
+            f"noise_std={metrics['noise_std']:.4f}  "
+            f"noise_reduction={metrics['noise_reduction']:.2f}"
+        )
+
+    torch.save(
+        {"epoch": int(epoch), "state_dict": net.state_dict(), "optimizer": optim.state_dict()},
+        output_dir / "weights.torch",
+    )
+
+    summary = plots.save_summary()
+    print("Training complete. Summary:", summary)
