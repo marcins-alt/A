@@ -9,8 +9,11 @@ from torch.utils.data import DataLoader
 import torch.nn as nn
 import torchvision.transforms.functional as TF
 from torchvision.transforms import RandomCrop
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+import numpy as np
+
 
 @dataclass
 class PairedRandomCrop:
@@ -47,11 +50,81 @@ class PatchDataset(torch.utils.data.Dataset):
         return self.crop(inp, tgt)
 
 
+
 @dataclass
 class Plots:
+    output_dir: Path
+    run_label:  str
+    train_losses:    list = field(default_factory=list)
+    val_losses:      list = field(default_factory=list)
 
+    def update(self, train_loss, val_loss, metrics: dict):
+        self.train_losses.append(train_loss)
+        self.val_losses.append(val_loss)
 
+    def save_curves(self):
+        epochs = range(1, len(self.train_losses) + 1)
+        
 
+        plt.tight_layout()
+        fig.savefig(self.output_dir / f"{self.run_label}_curves.png", dpi=150)
+        plt.close(fig)
+
+    def save_image_grid(self, inp_np, pred_np, tgt_np, epoch, roi_size=64):
+        """
+        Shows input / predicted / target with ROI overlays
+        and a difference map (pred - target).
+        """
+        flat_rc, edge_rc, rs = select_rois(pred_np, roi_size)
+
+        fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+        fig.suptitle(f"{self.run_label}  |  epoch {epoch}", fontsize=10)
+        vmin, vmax = np.percentile(tgt_np, [1, 99])
+
+        for ax, img, title in zip(
+            axes[:3],
+            [inp_np, pred_np, tgt_np],
+            ["Input (split recon)", "Predicted", "Target (full recon)"],
+        ):
+            ax.imshow(img, cmap="gray", vmin=vmin, vmax=vmax)
+            ax.set_title(title, fontsize=9)
+            ax.axis("off")
+            # overlay ROIs on predicted panel only
+            if title == "Predicted":
+                for rc, color, label in [
+                    (flat_rc, "cyan",   "noise ROI"),
+                    (edge_rc, "yellow", "edge ROI"),
+                ]:
+                    rect = plt.Rectangle(
+                        (rc[1], rc[0]), rs, rs,
+                        linewidth=1.5, edgecolor=color, facecolor="none",
+                        label=label
+                    )
+                    ax.add_patch(rect)
+                ax.legend(fontsize=7, loc="lower right")
+
+        diff = pred_np - tgt_np
+        im = axes[3].imshow(diff, cmap="bwr",
+                            vmin=-np.abs(diff).max(),
+                            vmax= np.abs(diff).max())
+        axes[3].set_title("Pred − Target", fontsize=9)
+        axes[3].axis("off")
+        plt.colorbar(im, ax=axes[3], fraction=0.046, pad=0.04)
+
+        plt.tight_layout()
+        fig.savefig(self.output_dir / f"{self.run_label}_epoch{epoch:03d}_grid.png", dpi=150)
+        plt.close(fig)
+
+    def save_summary(self):
+        best_epoch = int(np.argmin(self.noise_stds)) + 1
+        summary = {
+            "best_epoch_by_noise":     best_epoch,
+            "best_noise_std":          float(np.min(self.noise_stds)),
+            "noise_reduction_at_best": float(self.noise_reductions[best_epoch - 1]),
+            "final_train_loss":        float(self.train_losses[-1]),
+        }
+        np.save(self.output_dir / f"{self.run_label}_summary.npy", summary)
+        return summary
 
 
 
