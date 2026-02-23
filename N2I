@@ -1,0 +1,141 @@
+from pathlib import Path
+from noise2inverse.datasets import (
+    TiffDataset,
+    Noise2InverseDataset,
+)
+
+import torch
+from torch.utils.data import DataLoader
+import torch.nn as nn
+import torchvision.transforms.functional as TF
+from torchvision.transforms import RandomCrop
+from dataclasses import dataclass
+from tqdm import tqdm
+
+@dataclass
+class PairedRandomCrop:
+    size: int
+
+    @staticmethod
+    def _ensure_chw(x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 2:          # H, W
+            return x.unsqueeze(0) # 1, H, W
+        if x.dim() == 3:          # C, H, W
+            return x
+        raise ValueError(f"Expected 2D or 3D tensor, got shape {tuple(x.shape)}")
+
+    def __call__(self, inp: torch.Tensor, tgt: torch.Tensor):
+        inp = self._ensure_chw(inp)
+        tgt = self._ensure_chw(tgt)
+
+        i, j, h, w = RandomCrop.get_params(inp, output_size=(self.size, self.size))
+        return TF.crop(inp, i, j, h, w), TF.crop(tgt, i, j, h, w)
+    
+@dataclass
+class PatchDataset(torch.utils.data.Dataset):
+    base_ds: object
+    patch_size: int = 256
+
+    def __post_init__(self):
+        self.crop = PairedRandomCrop(self.patch_size)
+
+    def __len__(self):
+        return len(self.base_ds)
+
+    def __getitem__(self, idx):
+        inp, tgt = self.base_ds[idx]
+        return self.crop(inp, tgt)
+
+
+@dataclass
+class Plots:
+
+
+
+
+
+
+
+
+
+
+# Directories
+train_dir = Path("/mnt/scratch/users/mms10/recon")
+output_dir = Path("weights")
+output_dir.mkdir(exist_ok=True)
+
+
+# Parameters
+num_splits = 4
+strategy = "X:1"
+epochs = 100
+batch_size = torch.tensor([4, 8, 16, 32, 64])[2]
+multi_gpu = False
+device = torch.device("cuda")
+network = "msd"
+patch_size = torch.tensor([256, 512, 1024])[0]
+learning_rate = torch.tensor([1e-4, 1e-3, 1e-2])[1]
+training_validation_split = 0.80 # 80% for training, 20% for validation
+
+
+
+
+# Scale pixel intensities during training such that its values roughly occupy the range [0,1].
+# This improves convergence.
+data_scaling = 200
+
+datasets = [TiffDataset(train_dir / f"{j}/*.tiff") for j in range(num_splits)]
+train_ds = PatchDataset(Noise2InverseDataset(*datasets, strategy=strategy), patch_size=patch_size)
+
+train_ds.base_ds.num_slices, train_ds.base_ds.num_splits
+
+
+
+# Dataloader and network:
+dl = DataLoader(
+    train_ds,
+    batch_size=batch_size,
+    shuffle=True,
+    num_workers=4, # 
+    pin_memory=True, # 
+    persistent_workers=True, #
+)
+
+# Option a) Use MSD network
+if network == "msd":
+    from msd_pytorch import MSDRegressionModel
+    model = MSDRegressionModel(1, 1, 100, 1, parallel=multi_gpu)
+    net = model.net
+    net = model.net.to(device)
+    optim = model.optimizer
+
+
+
+# The dataset contains multiple input-target pairs for each slice. 
+# Therefore, we divide by the number of splits to obtain the effective number of epochs.
+train_epochs = max(epochs // num_splits, 1)
+
+# training loop
+for epoch in range(train_epochs):
+    # Train
+    for (inp, tgt) in tqdm(dl):
+        inp = inp.to(device, non_blocking=True) * data_scaling
+        tgt = tgt.to(device, non_blocking=True) * data_scaling
+
+        # Do training step with masking
+        output = net(inp)
+        loss = nn.functional.mse_loss(output, tgt)
+        optim.zero_grad()
+        loss.backward()
+        optim.step()
+
+    # Save network 
+    torch.save(
+        {"epoch": int(epoch), "state_dict": net.state_dict(), "optimizer": optim.state_dict()}, 
+        output_dir / f"weights_epoch_{epoch}.torch"
+    )
+    
+torch.save(
+    {"epoch": int(epoch), "state_dict": net.state_dict(), "optimizer": optim.state_dict()}, 
+    output_dir / "weights.torch"
+)
